@@ -93,7 +93,7 @@ void scheduler_context_switch(pid_t worker_pid) {
   if(ptrace(PTRACE_SETREGSET, worker_pid, NT_PRSTATUS, &worker_vec) != 0) {
     error(1, errno, "scheduler_context_switch: Failed to reset worker registers");
   }
-  
+
   if(ptrace(PTRACE_CONT, worker_pid, 0, 0) != 0) {
     error(1, errno, "scheduler_context_switch: Failed to resume worker thread");
   }
@@ -106,10 +106,10 @@ void coordinator_context_switch(struct worker_thread* w, message msg) {
 
     // Save regs
     w->run_q_head->regs = msg.regs;
-    
+
     w->run_q_head = w->run_q_head->next;
     memcpy(w->working_stack, w->run_q_head->stack, STACK_SIZE);
-   
+
     msg.mtype = MSG_CONTEXT_SWITCH_RSP;
     msg.regs = w->run_q_head->regs;
     if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
@@ -289,19 +289,19 @@ int main(int argc, char** argv) {
   if(msgsnd(mq, &snapshot_msg, MSG_SIZE, 0) == -1) {
     error(1, errno, "Failed to put snapshot msg on mq");
   }
-  
+
 
   if(msgrcv(mq, &snapshot_msg, MSG_SIZE, MSG_SNAPSHOT_RSP, 0) == -1) {
     error(1, errno, "Failed to read snapshot response from qm: %d", errno);
   }
- 
+
   if(ptrace(PTRACE_CONT, msg.pid, 0, 0) != 0) {
     error(1, errno, "Failed to resume worker thread");
   }
 
   printf("scheduler: Entering context switching mode.\n");
-  for(int i= 0; i < 10; i++) {
-    sleep(5);
+  for(int i= 0; i < 20; i++) {
+    sleep(2);
     scheduler_context_switch(msg.pid);
   }
 
@@ -312,7 +312,11 @@ int main(int argc, char** argv) {
   }
 
   printf("scheduler: Waiting for coordinator to exit\n");
-  waitpid(coordinator_pid, NULL, WEXITED); 
+  waitpid(coordinator_pid, NULL, WEXITED);
+
+  if(msgctl(mq, IPC_RMID, NULL) == -1) {
+    error(1, errno, "Failed to remove mq");
+  }
 
   return 0;
 }
