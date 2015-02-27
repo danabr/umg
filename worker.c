@@ -15,7 +15,6 @@
 #include "sys/msg.h"    // msgsnd, msgrcv
 #include "sys/wait.h"   // SIGCHLD
 
-#define MQ 0            // Create with ipcmk -Q
 #define STACK_SIZE (1024*1024)
 
 #define MSG_SIZE sizeof(struct message) - sizeof(long)
@@ -30,6 +29,8 @@
 #define MSG_CONTEXT_SWITCH_REQ 8
 #define MSG_CONTEXT_SWITCH_RSP 9
 #define MSG_SPAWN_REQ 10
+
+int mq;
 
 typedef struct message {
   long mtype;
@@ -79,11 +80,11 @@ void scheduler_context_switch(pid_t worker_pid) {
   }
 
   msg.mtype = MSG_CONTEXT_SWITCH_REQ;
-  if(msgsnd(MQ, &msg, MSG_SIZE, 0) == -1) {
+  if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
     error(1, errno, "scheduler_context_switch: Failed to send ctcx switch request");
   }
 
-  if(msgrcv(MQ, &msg, MSG_SIZE, MSG_CONTEXT_SWITCH_RSP, 0) == -1) {
+  if(msgrcv(mq, &msg, MSG_SIZE, MSG_CONTEXT_SWITCH_RSP, 0) == -1) {
     error(1, errno, "scheduler_context_switch: Failed to read ctxt switch response");
   }
 
@@ -109,7 +110,7 @@ void coordinator_context_switch(struct worker_thread* w, message msg) {
    
     msg.mtype = MSG_CONTEXT_SWITCH_RSP;
     msg.regs = w->run_q_head->regs;
-    if(msgsnd(MQ, &msg, MSG_SIZE, 0) == -1) {
+    if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
       error(1, errno, "cordinator: Failed to perform context switch");
     }
   } else {
@@ -120,7 +121,7 @@ void coordinator_context_switch(struct worker_thread* w, message msg) {
 // Worker thread.
 static int run_worker_thread(void *data) {
   struct message msg;
-  if(msgrcv(MQ, &msg, MSG_SIZE, MSG_START_WORK_REQ, 0) == -1) {
+  if(msgrcv(mq, &msg, MSG_SIZE, MSG_START_WORK_REQ, 0) == -1) {
     error(1, errno, "worker: Failed waiting on worker function");
   }
 
@@ -131,7 +132,7 @@ static void spawn(int (*fun)()) {
   message msg;
   msg.worker_fun = fun;
   msg.mtype = MSG_SPAWN_REQ;
-  if(msgsnd(MQ, &msg, MSG_SIZE, 0) == -1) {
+  if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
     error(1, errno, "Failed to put worker pid on mq");
   }
 }
@@ -190,11 +191,11 @@ static int coordinate(void* arg) {
   message msg;
   msg.mtype = MSG_PID;
   msg.pid = worker_thread.pid;
-  if(msgsnd(MQ, &msg, MSG_SIZE, 0) == -1) {
+  if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
     error(1, errno, "Failed to put worker pid on mq");
   }
 
-  if(msgrcv(MQ, &msg, MSG_SIZE, MSG_SNAPSHOT_REQ, 0) == -1) {
+  if(msgrcv(mq, &msg, MSG_SIZE, MSG_SNAPSHOT_REQ, 0) == -1) {
     error(1, errno, "Failed to read snapshot request from parent");
   }
 
@@ -202,7 +203,7 @@ static int coordinate(void* arg) {
   worker_thread.starting_regs = msg.regs;
 
   msg.mtype = MSG_SNAPSHOT_RSP;
-  if(msgsnd(MQ, &msg, MSG_SIZE, 0) == -1) {
+  if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
     error(1, errno, "Failed to inform parent that stack had been copied");
   }
 
@@ -212,17 +213,17 @@ static int coordinate(void* arg) {
 
   msg.mtype = MSG_START_WORK_REQ;
   msg.worker_fun = count_cats;
-  if(msgsnd(MQ, &msg, MSG_SIZE, 0) == -1) {
+  if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
     error(1, errno, "Failed to send start work message");
   }
 
-  if(msgrcv(MQ, &msg, MSG_SIZE, MSG_CONTEXT_SWITCH_REQ, 0) == -1) {
+  if(msgrcv(mq, &msg, MSG_SIZE, MSG_CONTEXT_SWITCH_REQ, 0) == -1) {
     error(1, errno, "Failed to receive context switch message");
   }
   coordinator_context_switch(&worker_thread, msg);
 
  
-  if(msgrcv(MQ, &msg, MSG_SIZE, MSG_SPAWN_REQ, 0) == -1) {
+  if(msgrcv(mq, &msg, MSG_SIZE, MSG_SPAWN_REQ, 0) == -1) {
     error(1, errno, "Failed to receive spawn message");
   }
 
@@ -235,14 +236,14 @@ static int coordinate(void* arg) {
 
   msg.mtype = MSG_START_WORK_REQ;
   // msg.worker_fun = msg.worker_fun;
-  if(msgsnd(MQ, &msg, MSG_SIZE, 0) == -1) {
+  if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
     error(1, errno, "Failed to send start worker req");
   }
 
 
   printf("coordinator: Entering context switching mode.\n");
   for(int i = 0; i < 9; i++) {
-    if(msgrcv(MQ, &msg, MSG_SIZE, MSG_CONTEXT_SWITCH_REQ, 0) == -1) {
+    if(msgrcv(mq, &msg, MSG_SIZE, MSG_CONTEXT_SWITCH_REQ, 0) == -1) {
       error(1, errno, "Failed to receive context switch message");
     }
     coordinator_context_switch(&worker_thread, msg);
@@ -250,6 +251,11 @@ static int coordinate(void* arg) {
 }
 
 int main(int argc, char** argv) {
+  mq = msgget(IPC_PRIVATE, 0600);
+  if(mq == -1) {
+    error(1, errno, "Failed to set up mq");
+  }
+
   pid_t coordinator_pid;
   char* coordinator_stack = malloc(STACK_SIZE);
   if(coordinator_stack == NULL) {
@@ -266,8 +272,8 @@ int main(int argc, char** argv) {
   }
 
   message msg;
-  if(msgrcv(MQ, &msg, MSG_SIZE, MSG_PID, 0) == -1) {
-    error(1, errno, "Failed to read worker PID from MQ");
+  if(msgrcv(mq, &msg, MSG_SIZE, MSG_PID, 0) == -1) {
+    error(1, errno, "Failed to read worker PID from mq");
   }
 
   struct user_regs_struct worker_regs;
@@ -280,12 +286,12 @@ int main(int argc, char** argv) {
   message snapshot_msg;
   snapshot_msg.mtype = MSG_SNAPSHOT_REQ;
   snapshot_msg.regs = worker_regs;
-  if(msgsnd(MQ, &snapshot_msg, MSG_SIZE, 0) == -1) {
+  if(msgsnd(mq, &snapshot_msg, MSG_SIZE, 0) == -1) {
     error(1, errno, "Failed to put snapshot msg on mq");
   }
   
 
-  if(msgrcv(MQ, &snapshot_msg, MSG_SIZE, MSG_SNAPSHOT_RSP, 0) == -1) {
+  if(msgrcv(mq, &snapshot_msg, MSG_SIZE, MSG_SNAPSHOT_RSP, 0) == -1) {
     error(1, errno, "Failed to read snapshot response from qm: %d", errno);
   }
  
