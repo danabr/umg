@@ -74,7 +74,7 @@ void scheduler_context_switch(pid_t worker_pid) {
     error(1, errno, "scheduler_context_switch: Failed to stop worker thread");
   }
 
-  usleep(50000);
+  usleep(1); // TODO: Ideally replaced with wait()ing.
 
   if(ptrace(PTRACE_GETREGSET, worker_pid, NT_PRSTATUS, &worker_vec) != 0) {
     error(1, errno, "scheduler_context_switch: GETREGSET for worker thread failed");
