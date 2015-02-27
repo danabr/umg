@@ -22,18 +22,19 @@
 #define MSG_PID 1
 #define MSG_SNAPSHOT_REQ 2
 #define MSG_SNAPSHOT_RSP 3
-#define MSG_REPLACE_STACK_REQ 4
-#define MSG_REPLACE_STACK_RSP 5
 #define MSG_START_WORK_REQ 6
-#define MSG_START_WORK_RSP 7
-#define MSG_CONTEXT_SWITCH_REQ 8
 #define MSG_CONTEXT_SWITCH_RSP 9
-#define MSG_SPAWN_REQ 10
+#define MSG_COORDINATOR_REQ 10
+
+#define MSG_COORDINATOR_REQ_CONTEXT_SWITCH 1
+#define MSG_COORDINATOR_REQ_SPAWN 2
+#define MSG_COORDINATOR_REQ_EXIT 3
 
 int mq;
 
 typedef struct message {
   long mtype;
+  char subtype;
   union {
     pid_t pid;
     struct user_regs_struct regs;
@@ -79,7 +80,8 @@ void scheduler_context_switch(pid_t worker_pid) {
     error(1, errno, "scheduler_context_switch: GETREGSET for worker thread failed");
   }
 
-  msg.mtype = MSG_CONTEXT_SWITCH_REQ;
+  msg.mtype = MSG_COORDINATOR_REQ;
+  msg.subtype = MSG_COORDINATOR_REQ_CONTEXT_SWITCH;
   if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
     error(1, errno, "scheduler_context_switch: Failed to send ctcx switch request");
   }
@@ -131,7 +133,8 @@ static int run_worker_thread(void *data) {
 static void spawn(int (*fun)()) {
   message msg;
   msg.worker_fun = fun;
-  msg.mtype = MSG_SPAWN_REQ;
+  msg.mtype = MSG_COORDINATOR_REQ;
+  msg.subtype = MSG_COORDINATOR_REQ_SPAWN;
   if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
     error(1, errno, "Failed to put worker pid on mq");
   }
@@ -141,7 +144,7 @@ static int count_dogs(void *data) {
   printf("worker: Counting dogs!\n");
   for(int i = 0; i < 1000; i++) {
     printf("worker: Bark %d\n", i);
-    sleep(1);
+    usleep(500000);
   }
   return 0;
 }
@@ -149,9 +152,8 @@ static int count_dogs(void *data) {
 static int count_cats(void *data) {
   printf("worker: Counting cats!\n");
   for(int i = 0; i < 1000; i++) {
-    if(i == 7) {
+    if(i > 1 && (i % 7) == 0) {
       spawn(count_dogs);
-      continue;
     }
     printf("worker: Miauuh %d\n", i);
     sleep(1);
@@ -163,7 +165,6 @@ static int count_cats(void *data) {
 static int coordinate(void* arg) {
   worker_thread worker_thread;
   worker cat_worker;
-  worker dog_worker;
 
   worker_thread.starting_stack = malloc(STACK_SIZE);
   if(worker_thread.starting_stack == NULL) {
@@ -177,11 +178,6 @@ static int coordinate(void* arg) {
   if(cat_worker.stack == NULL) {
     error(1, errno, "Failed to allocate memory for cat worker");
   }
-  dog_worker.stack = malloc(STACK_SIZE);
-  if(dog_worker.stack == NULL) {
-    error(1, errno, "Failed to allocate memory for dog worker");
-  }
-
 
   worker_thread.pid = clone(run_worker_thread, worker_thread.working_stack + STACK_SIZE, CLONE_SIGHAND | CLONE_VM | CLONE_THREAD | CLONE_PTRACE, 0);
   if(worker_thread.pid == -1) {
@@ -217,36 +213,40 @@ static int coordinate(void* arg) {
     error(1, errno, "Failed to send start work message");
   }
 
-  if(msgrcv(mq, &msg, MSG_SIZE, MSG_CONTEXT_SWITCH_REQ, 0) == -1) {
-    error(1, errno, "Failed to receive context switch message");
-  }
-  coordinator_context_switch(&worker_thread, msg);
-
- 
-  if(msgrcv(mq, &msg, MSG_SIZE, MSG_SPAWN_REQ, 0) == -1) {
-    error(1, errno, "Failed to receive spawn message");
-  }
-
-  dog_worker.next = worker_thread.run_q_head;
-  memcpy(dog_worker.stack, worker_thread.starting_stack, STACK_SIZE);
-  dog_worker.regs = worker_thread.starting_regs;
-
-  worker_thread.run_q_tail->next = &dog_worker;
-  worker_thread.run_q_tail = &dog_worker;
-
-  msg.mtype = MSG_START_WORK_REQ;
-  // msg.worker_fun = msg.worker_fun;
-  if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
-    error(1, errno, "Failed to send start worker req");
-  }
-
-
-  printf("coordinator: Entering context switching mode.\n");
-  for(int i = 0; i < 9; i++) {
-    if(msgrcv(mq, &msg, MSG_SIZE, MSG_CONTEXT_SWITCH_REQ, 0) == -1) {
-      error(1, errno, "Failed to receive context switch message");
+  for(;;) {
+    if(msgrcv(mq, &msg, MSG_SIZE, MSG_COORDINATOR_REQ, 0) == -1) {
+      error(1, errno, "coordinator: Failed to receive message");
     }
-    coordinator_context_switch(&worker_thread, msg);
+    if(msg.subtype == MSG_COORDINATOR_REQ_CONTEXT_SWITCH) {
+      printf("coordinator: Context switching\n");
+      coordinator_context_switch(&worker_thread, msg);
+    } else if(msg.subtype == MSG_COORDINATOR_REQ_SPAWN) {
+      printf("coordinator: Spawning new worker\n");
+      worker* worker = malloc(sizeof(struct worker));
+      if(worker == NULL) {
+        error(1, errno, "Failed to allocate memory for worker");
+      }
+      worker->stack = malloc(STACK_SIZE);
+      if(worker->stack == NULL) {
+        error(1, errno, "Failed to allocate stack memory for worker");
+      }
+
+      worker->next = worker_thread.run_q_head;
+      memcpy(worker->stack, worker_thread.starting_stack, STACK_SIZE);
+      worker->regs = worker_thread.starting_regs;
+
+      worker_thread.run_q_tail->next = worker;
+      worker_thread.run_q_tail = worker;
+
+      msg.mtype = MSG_START_WORK_REQ;
+      // msg.worker_fun = msg.worker_fun;
+      if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
+        error(1, errno, "Failed to send start worker req");
+      }
+    } else if(msg.subtype == MSG_COORDINATOR_REQ_EXIT) {
+      printf("coordinator: Exiting as planned");
+      return 0;
+    }
   }
 }
 
@@ -305,7 +305,14 @@ int main(int argc, char** argv) {
     scheduler_context_switch(msg.pid);
   }
 
-  sleep(1);
+  snapshot_msg.mtype = MSG_COORDINATOR_REQ;
+  snapshot_msg.subtype = MSG_COORDINATOR_REQ_EXIT;
+  if(msgsnd(mq, &snapshot_msg, MSG_SIZE, 0) == -1) {
+    error(1, errno, "Failed to send exit msg to coordinator");
+  }
+
+  printf("scheduler: Waiting for coordinator to exit\n");
+  waitpid(coordinator_pid, NULL, WEXITED); 
 
   return 0;
 }
