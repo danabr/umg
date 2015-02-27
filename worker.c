@@ -74,7 +74,7 @@ void scheduler_context_switch(pid_t worker_pid) {
     error(1, errno, "scheduler_context_switch: Failed to stop worker thread");
   }
 
-  sleep(1);
+  usleep(50000);
 
   if(ptrace(PTRACE_GETREGSET, worker_pid, NT_PRSTATUS, &worker_vec) != 0) {
     error(1, errno, "scheduler_context_switch: GETREGSET for worker thread failed");
@@ -218,10 +218,8 @@ static int coordinate(void* arg) {
       error(1, errno, "coordinator: Failed to receive message");
     }
     if(msg.subtype == MSG_COORDINATOR_REQ_CONTEXT_SWITCH) {
-      printf("coordinator: Context switching\n");
       coordinator_context_switch(&worker_thread, msg);
     } else if(msg.subtype == MSG_COORDINATOR_REQ_SPAWN) {
-      printf("coordinator: Spawning new worker\n");
       worker* worker = malloc(sizeof(struct worker));
       if(worker == NULL) {
         error(1, errno, "Failed to allocate memory for worker");
