@@ -14,6 +14,8 @@
 #include "mqueue.h"     // iovec
 #include "sys/msg.h"    // msgsnd, msgrcv
 #include "sys/wait.h"   // SIGCHLD
+#include "time.h"       // clock_gettime
+#include "sys/time.h"   // timeradd
 
 #define STACK_SIZE (1024*1024)
 
@@ -25,10 +27,16 @@
 #define MSG_START_WORK_REQ 6
 #define MSG_CONTEXT_SWITCH_RSP 9
 #define MSG_COORDINATOR_REQ 10
+#define MSG_WORKER_CONTINUE  11
 
 #define MSG_COORDINATOR_REQ_CONTEXT_SWITCH 1
 #define MSG_COORDINATOR_REQ_SPAWN 2
 #define MSG_COORDINATOR_REQ_EXIT 3
+#define MSG_COORDINATOR_REQ_USLEEP 4
+
+# define WORKER_STATE_RUN 0
+# define WORKER_STATE_WAIT 1
+
 
 int mq;
 
@@ -39,15 +47,23 @@ typedef struct message {
     pid_t pid;
     struct user_regs_struct regs;
     int (*worker_fun)();
+    struct timeval time;
   };
 } message;
 
 
 typedef struct worker {
+  int state;
   char* stack;
   struct user_regs_struct regs;
   struct worker* next;
 } worker;
+
+typedef struct waiting_worker {
+  struct timeval wait_to;
+  struct worker* worker;
+  struct waiting_worker* next;
+} waiting_worker;
 
 typedef struct worker_thread {
   pid_t pid;
@@ -56,15 +72,22 @@ typedef struct worker_thread {
   struct user_regs_struct starting_regs;
   worker* run_q_head;
   worker* run_q_tail;
+  waiting_worker* wait_q_head;
 } worker_thread;
 
-// Context thread
-// * stop thread
-// * save regs
-// * save stack
-// * replace regs
-// * replace stack
-// * resume thread
+waiting_worker* add_to_wait_q(waiting_worker* head, waiting_worker* new) {
+  if(head == NULL || timercmp(&head->wait_to, &new->wait_to, >)) {
+    new->next = head;
+    return new;
+  }
+  while(head->next != NULL) {
+    if(!timercmp(&head->next->wait_to, &new->wait_to, >)) { break; }
+    head = head->next;
+  }
+  new->next = head->next;
+  head->next = new;
+  return head;
+}
 
 void scheduler_context_switch(pid_t worker_pid) {
   message msg;
@@ -99,15 +122,63 @@ void scheduler_context_switch(pid_t worker_pid) {
   }
 }
 
+worker* find_next_worker_to_switch_to(worker_thread* worker_thread) {
+  worker* start = worker_thread->run_q_head;
+  worker* w = start;
+  for(;;) {
+    if(w->next == start) { return start; }
+    if(w->next->state == WORKER_STATE_WAIT) {
+      w->next = w->next->next;
+    } else {
+      return w->next;
+    }
+  }
+}
+
+void update_wait_q(worker_thread* worker_thread) {
+  if(worker_thread->wait_q_head == NULL) { return; }
+
+  struct timespec now_ts;
+  struct timeval now_tv;
+
+  if(clock_gettime(CLOCK_REALTIME, &now_ts) != 0) {
+    error(1, errno, "coordinator: Failed to get system time");
+  }
+  TIMESPEC_TO_TIMEVAL(&now_tv, &now_ts);
+
+  for(;;) {
+    waiting_worker* waiter = worker_thread->wait_q_head;
+    if(waiter != NULL && timercmp(&now_tv, &waiter->wait_to, >)) {
+      waiter->worker->next = worker_thread->run_q_head;
+      worker_thread->run_q_tail->next = waiter->worker;
+      worker_thread->run_q_tail = waiter->worker;
+      waiter->worker->state = WORKER_STATE_RUN;
+      worker_thread->wait_q_head = waiter->next;
+
+      message msg;
+      msg.mtype = MSG_WORKER_CONTINUE;
+      if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
+        error(1, errno, "coordinator: Failed to send worker resume message");
+      }
+
+      free(waiter);
+    } else {
+      break;
+    }
+  }
+}
+
 void coordinator_context_switch(struct worker_thread* w, message msg) {
-  if(w->run_q_head->next != NULL) {
+  worker* next = find_next_worker_to_switch_to(w);
+  update_wait_q(w);
+  if(next != NULL) {
     // Save stack
     memcpy(w->run_q_head->stack, w->working_stack, STACK_SIZE);
 
     // Save regs
     w->run_q_head->regs = msg.regs;
 
-    w->run_q_head = w->run_q_head->next;
+    w->run_q_head = next;
     memcpy(w->working_stack, w->run_q_head->stack, STACK_SIZE);
 
     msg.mtype = MSG_CONTEXT_SWITCH_RSP;
@@ -118,6 +189,48 @@ void coordinator_context_switch(struct worker_thread* w, message msg) {
   } else {
     error(1, 0, "coordinator: Nothing to context switch too!");
   }
+}
+
+void task_wait_for_continue() {
+  message msg;
+  int ret;
+  for(;;) {
+    if(msgrcv(mq, &msg, MSG_SIZE, MSG_WORKER_CONTINUE, IPC_NOWAIT) == -1) {
+      if(errno != ENOMSG) {
+        error(1, errno, "worker: Failed waiting on continue");
+      }
+    } else {
+      return;
+    }
+  }
+}
+
+void task_usleep(useconds_t delay) {
+  message msg;
+  msg.mtype = MSG_COORDINATOR_REQ;
+  msg.subtype = MSG_COORDINATOR_REQ_USLEEP;
+
+  time_t sec = delay % 1000000;
+  suseconds_t usec = delay - (sec * 1000000);
+
+  struct timespec current_ts;
+  if(clock_gettime(CLOCK_REALTIME, &current_ts) != 0) {
+      error(1, errno, "worker: Failed to get system time");
+  }
+
+  struct timeval current_tv;
+  current_tv.tv_sec = current_ts.tv_sec;
+  current_tv.tv_usec = current_ts.tv_nsec / 1000;
+
+  struct timeval to_add;
+  to_add.tv_sec = sec;
+  to_add.tv_usec = usec;
+  timeradd(&current_tv, &to_add, &msg.time);
+
+  if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
+    error(1, errno, "worker: Failed to put sleep request on mq");
+  }
+  task_wait_for_continue();
 }
 
 // Worker thread.
@@ -144,7 +257,7 @@ static int count_dogs(void *data) {
   printf("worker: Counting dogs!\n");
   for(int i = 0; i < 1000; i++) {
     printf("worker: Bark %d\n", i);
-    usleep(500000);
+    task_usleep(10000000);
   }
   return 0;
 }
@@ -156,7 +269,7 @@ static int count_cats(void *data) {
       spawn(count_dogs);
     }
     printf("worker: Miauuh %d\n", i);
-    sleep(1);
+    task_usleep(1000000);
   }
   return 0;
 }
@@ -183,6 +296,8 @@ static int coordinate(void* arg) {
   if(worker_thread.pid == -1) {
     error(1, errno, "Failed to start worker thread");
   }
+
+  worker_thread.wait_q_head = NULL;
 
   message msg;
   msg.mtype = MSG_PID;
@@ -224,6 +339,7 @@ static int coordinate(void* arg) {
       if(worker == NULL) {
         error(1, errno, "Failed to allocate memory for worker");
       }
+      worker->state = WORKER_STATE_RUN;
       worker->stack = malloc(STACK_SIZE);
       if(worker->stack == NULL) {
         error(1, errno, "Failed to allocate stack memory for worker");
@@ -241,6 +357,15 @@ static int coordinate(void* arg) {
       if(msgsnd(mq, &msg, MSG_SIZE, 0) == -1) {
         error(1, errno, "Failed to send start worker req");
       }
+    } else if(msg.subtype == MSG_COORDINATOR_REQ_USLEEP) {
+      // TODO: Check which worker wants to go to sleep.
+      // It is not necessarily the worker that is currently running!
+      waiting_worker* wait = malloc(sizeof(struct waiting_worker));
+      wait->wait_to = msg.time;
+      wait->worker = worker_thread.run_q_head;
+      worker_thread.wait_q_head = add_to_wait_q(worker_thread.wait_q_head, wait);
+      worker_thread.run_q_head->state = WORKER_STATE_WAIT;
+      // TODO: Do not waste the entire window waiting for the next reschedule
     } else if(msg.subtype == MSG_COORDINATOR_REQ_EXIT) {
       printf("coordinator: Exiting as planned");
       return 0;
@@ -298,8 +423,8 @@ int main(int argc, char** argv) {
   }
 
   printf("scheduler: Entering context switching mode.\n");
-  for(int i= 0; i < 20; i++) {
-    sleep(2);
+  for(int i= 0; i < 60; i++) {
+    usleep(500000);
     scheduler_context_switch(msg.pid);
   }
 
